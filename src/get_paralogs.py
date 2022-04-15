@@ -27,6 +27,7 @@ def fetch_genes(organism):
     """List genes symbols for an organism
     """
 
+    ids_by_gene = {}
     genes = []
     prefix = ''
     # E.g. https://raw.githubusercontent.com/eweitz/ideogram/master/dist/data/cache/homo-sapiens-genes.tsv
@@ -52,23 +53,27 @@ def fetch_genes(organism):
                 prefix = row[0].split('prefix: ')[1]
                 continue
         if len(row) < 4: continue
+        # row: [chr, start, length, slim_id, symbol, description]
         gene = row[4] # more formally, gene symbol
+        id = row[3]
+        ids_by_gene[gene] = id
         genes.append(gene)
 
-    return [genes, prefix]
+    return [genes, prefix, ids_by_gene]
 
 def slug(value):
     return value.lower().replace(" ", "-")
 
-def lossy_optimize_paralogs(json_str, max_returned):
+def lossy_optimize_paralogs(json_str):
     json = ljson.loads(json_str)
 
     trimmed_ids = []
     for h in json["data"][0]["homologies"]:
         trimmed_id = re.sub(r'[A-Za-z]+0+', '', h["id"])
-        trimmed_ids.append(trimmed_id)
-
-    return "\t".join(trimmed_ids[:max_returned])
+        trimmed_ids.append(int(trimmed_id))
+    # print('trimmed_ids')
+    # print(trimmed_ids)
+    return trimmed_ids
 
 
 class EnsemblCache():
@@ -138,15 +143,23 @@ class EnsemblCache():
             with open(json_path, "w") as f:
                 f.write(paralogs)
 
-    def optimize_paralogs(self, genes, tmp_gene_dir, gene_dir):
+    def optimize_paralogs(self, genes, ids_by_gene, tmp_gene_dir, gene_dir):
         optimize_errors = []
+
+        genes_by_paralogs = {}
+
+        num_redundant_paralogs = 0
 
         rows = []
         for gene in genes:
         # for gene in genes[:50]: # Helpful for debugging
 
-            # Disregard fusion genes
-            if "/" in gene: continue
+            # Disregard fusion genes and genes like "AC113554.1"
+            if (
+                "/" in gene or
+                re.match(r'^(AC|AL|BX|AF)[0-9]+\.[0-9]$', gene) #or
+                # re.match(r'^RNU[0-9]-', gene)
+            ): continue
 
             # original_name = json_path.split("/")[-1]
             # gene = original_name.split(".json")[0]
@@ -188,10 +201,31 @@ class EnsemblCache():
             print(f"Optimizing to create: {optimized_tsv_path}")
 
             try:
-                tsv = lossy_optimize_paralogs(json, 20).encode()
+                paralogs = lossy_optimize_paralogs(json)
+                paralogs.sort()
+
+                gene_id = int(ids_by_gene[gene])
+                paralogs.append(gene_id)
+                tmp_ids = paralogs
+                tmp_ids.sort()
+
+                tsv = "\t".join([str(i) for i in paralogs])
+                tmp_tsv = "\t".join([str(i) for i in tmp_ids])
+
+                # Many genes share all their paralogs (minus themselves) with
+                # other genes.  This accounts for that, and compresses the
+                # combined paralog cache size by ~3x.
+                if "\t" in tsv:
+                    if tmp_tsv in genes_by_paralogs:
+                        tsv = genes_by_paralogs[tmp_tsv]
+                        num_redundant_paralogs += 1
+                    else:
+                        genes_by_paralogs[tmp_tsv] = gene
+
                 # tsv = lossless_optimize_paralogs(tsv, gene)
                 # tsv = gzip.compress(tsv)
 
+                tsv = tsv.encode()
             except Exception as e:
                 handled = "Encountered error converting TSV for gene"
                 handled2 = "not well-formed"
@@ -213,6 +247,8 @@ class EnsemblCache():
             if len(tsv) > 0:
                 rows.append(f"{gene}\t{tsv}")
 
+        print('num_redundant_paralogs')
+        print(num_redundant_paralogs)
         num_errors = len(optimize_errors)
         if num_errors > 0:
             print(f"{num_errors} pathways had optimization errors:")
@@ -235,11 +271,11 @@ class EnsemblCache():
         # if not os.path.exists(gpml_dir):
         #     os.makedirs(gpml_dir)
 
-        [genes, prefix] = fetch_genes(organism)
+        [genes, prefix, ids_by_gene] = fetch_genes(organism)
         # self.fetch_paralogs(organism, genes, tmp_gene_dir)
         print('len(genes)')
         print(len(genes))
-        rows = self.optimize_paralogs(genes, tmp_gene_dir, gene_dir)
+        rows = self.optimize_paralogs(genes, ids_by_gene, tmp_gene_dir, gene_dir)
 
         combined_dir = self.output_dir + "combined/"
         if not os.path.exists(combined_dir):
@@ -258,7 +294,7 @@ class EnsemblCache():
         Consider parallelizing this.
         """
         # organisms = ["Homo sapiens", "Mus musculus"] # Comment out to use all
-        # organisms = ["Homo sapiens"] # Comment out to use all
+        organisms = ["Homo sapiens"] # Comment out to use all
         # organisms = ["Caenorhabditis elegans"] # Comment out to use all
         for organism in organisms:
             self.populate_by_org(organism)
