@@ -71,8 +71,6 @@ def lossy_optimize_paralogs(json_str):
     for h in json["data"][0]["homologies"]:
         trimmed_id = re.sub(r'[A-Za-z]+0+', '', h["id"])
         trimmed_ids.append(int(trimmed_id))
-    # print('trimmed_ids')
-    # print(trimmed_ids)
     return trimmed_ids
 
 
@@ -203,9 +201,11 @@ class EnsemblCache():
             try:
                 paralogs = lossy_optimize_paralogs(json)
                 paralogs.sort()
+                if len(paralogs) == 0:
+                    continue
 
-                gene_id = int(ids_by_gene[gene])
-                paralogs.append(gene_id)
+                gene_id = ids_by_gene[gene]
+                paralogs.append(int(gene_id))
                 tmp_ids = paralogs
                 tmp_ids.sort()
 
@@ -217,13 +217,17 @@ class EnsemblCache():
                 # combined paralog cache size by ~3x.
                 if "\t" in tsv:
                     if tmp_tsv in genes_by_paralogs:
-                        tsv = genes_by_paralogs[tmp_tsv]
+                        tsv = '_' + genes_by_paralogs[tmp_tsv]
                         num_redundant_paralogs += 1
                     else:
                         genes_by_paralogs[tmp_tsv] = gene
 
-                # tsv = lossless_optimize_paralogs(tsv, gene)
-                # tsv = gzip.compress(tsv)
+                # Omit current gene from its own paralog list
+                split_tsv = tsv.split("\t")
+                if (gene_id in split_tsv):
+                    split_tsv.remove(gene_id)
+                tsv = "\t".join(split_tsv)
+                tsv = gene_id + "\t" + tsv
 
                 tsv = tsv.encode()
             except Exception as e:
