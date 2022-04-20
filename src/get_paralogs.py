@@ -11,6 +11,7 @@ from time import sleep
 import json as ljson
 import gzip
 import csv
+import traceback
 
 import requests
 
@@ -28,6 +29,7 @@ def fetch_genes(organism):
     """
 
     ids_by_gene = {}
+    genes_by_id = {}
     genes = []
     prefix = ''
     # E.g. https://raw.githubusercontent.com/eweitz/ideogram/master/dist/data/cache/homo-sapiens-genes.tsv
@@ -41,7 +43,7 @@ def fetch_genes(organism):
 
     if response.status_code != 200:
         print(f"Status code {response.status_code} for {genes_url}")
-        return [genes, prefix]
+        return [genes, prefix, ids_by_gene, genes_by_id]
 
     tsv_string = gzip.decompress(response.content).decode('utf-8')
     # print('tsv_string')
@@ -57,22 +59,28 @@ def fetch_genes(organism):
         gene = row[4] # more formally, gene symbol
         id = row[3]
         ids_by_gene[gene] = id
+        genes_by_id[id] = gene
         genes.append(gene)
 
-    return [genes, prefix, ids_by_gene]
+    return [genes, prefix, ids_by_gene, genes_by_id]
 
 def slug(value):
     return value.lower().replace(" ", "-")
 
 def lossy_optimize_paralogs(json_str):
-    json = ljson.loads(json_str)
+    try:
+        json = ljson.loads(json_str)
+    except Exception as e:
+        return []
+
+    if "error" in json:
+        return []
 
     trimmed_ids = []
     for h in json["data"][0]["homologies"]:
         trimmed_id = re.sub(r'[A-Za-z]+0+', '', h["id"])
         trimmed_ids.append(int(trimmed_id))
     return trimmed_ids
-
 
 class EnsemblCache():
 
@@ -141,12 +149,13 @@ class EnsemblCache():
             with open(json_path, "w") as f:
                 f.write(paralogs)
 
-    def optimize_paralogs(self, genes, ids_by_gene, tmp_gene_dir, gene_dir):
+    def optimize_paralogs(self, genes, ids_by_gene, genes_by_id, tmp_gene_dir, gene_dir):
         optimize_errors = []
 
         genes_by_paralogs = {}
 
         num_redundant_paralogs = 0
+        seen_genes = {}
 
         rows = []
         for gene in genes:
@@ -167,10 +176,14 @@ class EnsemblCache():
                 optimize_errors.append(gene)
                 continue
 
+            original_gene = gene
             # The same genes are often capitalized differently in different
             # organisms.  We can leverage this to decrease cache size by
             # ~2x.  E.g. human "MTOR" and orthologous mouse "Mtor".
             gene = gene.upper()
+
+            if original_gene in seen_genes:
+                continue
 
             # pwid = re.search(r"WP\d+", name).group() # pathway ID
             optimized_tsv_path = gene_dir + gene + ".tsv"
@@ -196,18 +209,27 @@ class EnsemblCache():
                 print(f"Gene found, but no paralogs for {gene}")
                 continue
 
-            print(f"Optimizing to create: {optimized_tsv_path}")
+            # print(f"Optimizing to create: {optimized_tsv_path}")
 
             try:
                 paralogs = lossy_optimize_paralogs(json)
-                paralogs.sort()
+
                 if len(paralogs) == 0:
                     continue
 
-                gene_id = ids_by_gene[gene]
+                if original_gene not in ids_by_gene:
+                    print('Missing gene in ids_by_gene: ' + original_gene)
+                    # exit()
+                    continue
+
+                gene_id = ids_by_gene[original_gene]
+                # print('paralogs, genes[:50], genes.index(genes_by_id[str(paralogs[0])])')
+                # print(paralogs, genes[:50], genes.index(genes_by_id[str(paralogs[0])]))
+                paralogs.sort()
                 paralogs.append(int(gene_id))
                 tmp_ids = paralogs
                 tmp_ids.sort()
+                # tmp_ids = sorted(tmp_ids, key=lambda p: genes.index(genes_by_id[str(p)]))
 
                 tsv = "\t".join([str(i) for i in paralogs])
                 tmp_tsv = "\t".join([str(i) for i in tmp_ids])
@@ -217,31 +239,38 @@ class EnsemblCache():
                 # combined paralog cache size by ~3x.
                 if "\t" in tsv:
                     if tmp_tsv in genes_by_paralogs:
-                        tsv = '_' + genes_by_paralogs[tmp_tsv]
+                        pointer = genes_by_paralogs[tmp_tsv]
+                        pointer_id = ids_by_gene[pointer]
+                        tsv = '_' + pointer + "\t" + pointer_id
                         num_redundant_paralogs += 1
                     else:
-                        genes_by_paralogs[tmp_tsv] = gene
+                        genes_by_paralogs[tmp_tsv] = original_gene
 
                 # Omit current gene from its own paralog list
                 split_tsv = tsv.split("\t")
                 if (gene_id in split_tsv):
                     split_tsv.remove(gene_id)
+
                 tsv = "\t".join(split_tsv)
                 tsv = gene_id + "\t" + tsv
 
                 tsv = tsv.encode()
+                seen_genes[original_gene] = 1
             except Exception as e:
                 handled = "Encountered error converting TSV for gene"
                 handled2 = "not well-formed"
                 if handled in str(e) or handled2 in str(e):
                     # print('Handled an error')
                     print(e)
-                    optimize_errors.append(gene)
+                    optimize_errors.append(original_gene)
                     continue
                 else:
                     print('Encountered fatal error')
-                    print(e)
+                    print(traceback.format_exc())
                     # raise Exception(e)
+                    # print('json')
+                    # print(json)
+                    # exit()
                     continue
 
             with open(optimized_tsv_path, "wb") as f:
@@ -249,7 +278,7 @@ class EnsemblCache():
 
             tsv = tsv.decode('utf-8')
             if len(tsv) > 0:
-                rows.append(f"{gene}\t{tsv}")
+                rows.append(f"{original_gene}\t{tsv}")
 
         print('num_redundant_paralogs')
         print(num_redundant_paralogs)
@@ -275,11 +304,11 @@ class EnsemblCache():
         # if not os.path.exists(gpml_dir):
         #     os.makedirs(gpml_dir)
 
-        [genes, prefix, ids_by_gene] = fetch_genes(organism)
+        [genes, prefix, ids_by_gene, genes_by_id] = fetch_genes(organism)
         # self.fetch_paralogs(organism, genes, tmp_gene_dir)
         print('len(genes)')
         print(len(genes))
-        rows = self.optimize_paralogs(genes, ids_by_gene, tmp_gene_dir, gene_dir)
+        rows = self.optimize_paralogs(genes, ids_by_gene, genes_by_id, tmp_gene_dir, gene_dir)
 
         combined_dir = self.output_dir + "combined/"
         if not os.path.exists(combined_dir):
@@ -298,7 +327,8 @@ class EnsemblCache():
         Consider parallelizing this.
         """
         # organisms = ["Homo sapiens", "Mus musculus"] # Comment out to use all
-        organisms = ["Homo sapiens"] # Comment out to use all
+        # organisms = ["Homo sapiens"] # Comment out to use all
+        # organisms = ["Mus musculus"] # Comment out to use all
         # organisms = ["Caenorhabditis elegans"] # Comment out to use all
         for organism in organisms:
             self.populate_by_org(organism)
