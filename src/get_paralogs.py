@@ -35,7 +35,7 @@ def fetch_genes(organism):
     # E.g. https://raw.githubusercontent.com/eweitz/ideogram/master/dist/data/cache/homo-sapiens-genes.tsv
     genes_url = (
         "https://raw.githubusercontent.com/eweitz/ideogram/"
-        f"master/dist/data/cache/{slug(organism)}-genes.tsv.gz"
+        f"master/dist/data/cache/genes/{slug(organism)}-genes.tsv.gz"
     )
     print('genes_url')
     print(genes_url)
@@ -250,6 +250,9 @@ class EnsemblCache():
                 split_tsv = tsv.split("\t")
                 if (gene_id in split_tsv):
                     split_tsv.remove(gene_id)
+
+                split_tsv = list(set(split_tsv))
+                split_tsv.sort()
 
                 tsv = "\t".join(split_tsv)
                 tsv = gene_id + "\t" + tsv
