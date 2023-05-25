@@ -225,6 +225,7 @@ class EnsemblCache():
                 gene_id = ids_by_gene[original_gene]
                 # print('paralogs, genes[:50], genes.index(genes_by_id[str(paralogs[0])])')
                 # print(paralogs, genes[:50], genes.index(genes_by_id[str(paralogs[0])]))
+                paralogs = list(set(paralogs))
                 paralogs.sort()
                 paralogs.append(int(gene_id))
                 tmp_ids = paralogs
@@ -250,9 +251,6 @@ class EnsemblCache():
                 split_tsv = tsv.split("\t")
                 if (gene_id in split_tsv):
                     split_tsv.remove(gene_id)
-
-                split_tsv = list(set(split_tsv))
-                split_tsv.sort()
 
                 tsv = "\t".join(split_tsv)
                 tsv = gene_id + "\t" + tsv
