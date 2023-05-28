@@ -11,6 +11,7 @@ from time import sleep
 import json as ljson
 import gzip
 import csv
+import traceback
 
 import requests
 
@@ -27,12 +28,14 @@ def fetch_genes(organism):
     """List genes symbols for an organism
     """
 
+    ids_by_gene = {}
+    genes_by_id = {}
     genes = []
     prefix = ''
     # E.g. https://raw.githubusercontent.com/eweitz/ideogram/master/dist/data/cache/homo-sapiens-genes.tsv
     genes_url = (
         "https://raw.githubusercontent.com/eweitz/ideogram/"
-        f"master/dist/data/cache/{slug(organism)}-genes.tsv.gz"
+        f"master/dist/data/cache/genes/{slug(organism)}-genes.tsv.gz"
     )
     print('genes_url')
     print(genes_url)
@@ -40,7 +43,7 @@ def fetch_genes(organism):
 
     if response.status_code != 200:
         print(f"Status code {response.status_code} for {genes_url}")
-        return [genes, prefix]
+        return [genes, prefix, ids_by_gene, genes_by_id]
 
     tsv_string = gzip.decompress(response.content).decode('utf-8')
     # print('tsv_string')
@@ -52,24 +55,32 @@ def fetch_genes(organism):
                 prefix = row[0].split('prefix: ')[1]
                 continue
         if len(row) < 4: continue
+        # row: [chr, start, length, slim_id, symbol, description]
         gene = row[4] # more formally, gene symbol
+        id = row[3]
+        ids_by_gene[gene] = id
+        genes_by_id[id] = gene
         genes.append(gene)
 
-    return [genes, prefix]
+    return [genes, prefix, ids_by_gene, genes_by_id]
 
 def slug(value):
     return value.lower().replace(" ", "-")
 
-def lossy_optimize_paralogs(json_str, max_returned):
-    json = ljson.loads(json_str)
+def lossy_optimize_paralogs(json_str):
+    try:
+        json = ljson.loads(json_str)
+    except Exception as e:
+        return []
+
+    if "error" in json:
+        return []
 
     trimmed_ids = []
     for h in json["data"][0]["homologies"]:
         trimmed_id = re.sub(r'[A-Za-z]+0+', '', h["id"])
-        trimmed_ids.append(trimmed_id)
-
-    return "\t".join(trimmed_ids[:max_returned])
-
+        trimmed_ids.append(int(trimmed_id))
+    return trimmed_ids
 
 class EnsemblCache():
 
@@ -138,15 +149,24 @@ class EnsemblCache():
             with open(json_path, "w") as f:
                 f.write(paralogs)
 
-    def optimize_paralogs(self, genes, tmp_gene_dir, gene_dir):
+    def optimize_paralogs(self, genes, ids_by_gene, genes_by_id, tmp_gene_dir, gene_dir):
         optimize_errors = []
+
+        genes_by_paralogs = {}
+
+        num_redundant_paralogs = 0
+        seen_genes = {}
 
         rows = []
         for gene in genes:
         # for gene in genes[:50]: # Helpful for debugging
 
-            # Disregard fusion genes
-            if "/" in gene: continue
+            # Disregard fusion genes and genes like "AC113554.1"
+            if (
+                "/" in gene or
+                re.match(r'^(AC|AL|BX|AF)[0-9]+\.[0-9]$', gene) #or
+                # re.match(r'^RNU[0-9]-', gene)
+            ): continue
 
             # original_name = json_path.split("/")[-1]
             # gene = original_name.split(".json")[0]
@@ -156,10 +176,14 @@ class EnsemblCache():
                 optimize_errors.append(gene)
                 continue
 
+            original_gene = gene
             # The same genes are often capitalized differently in different
             # organisms.  We can leverage this to decrease cache size by
             # ~2x.  E.g. human "MTOR" and orthologous mouse "Mtor".
             gene = gene.upper()
+
+            if original_gene in seen_genes:
+                continue
 
             # pwid = re.search(r"WP\d+", name).group() # pathway ID
             optimized_tsv_path = gene_dir + gene + ".tsv"
@@ -185,25 +209,69 @@ class EnsemblCache():
                 print(f"Gene found, but no paralogs for {gene}")
                 continue
 
-            print(f"Optimizing to create: {optimized_tsv_path}")
+            # print(f"Optimizing to create: {optimized_tsv_path}")
 
             try:
-                tsv = lossy_optimize_paralogs(json, 20).encode()
-                # tsv = lossless_optimize_paralogs(tsv, gene)
-                # tsv = gzip.compress(tsv)
+                paralogs = lossy_optimize_paralogs(json)
 
+                if len(paralogs) == 0:
+                    continue
+
+                if original_gene not in ids_by_gene:
+                    print('Missing gene in ids_by_gene: ' + original_gene)
+                    # exit()
+                    continue
+
+                gene_id = ids_by_gene[original_gene]
+                # print('paralogs, genes[:50], genes.index(genes_by_id[str(paralogs[0])])')
+                # print(paralogs, genes[:50], genes.index(genes_by_id[str(paralogs[0])]))
+                paralogs = list(set(paralogs))
+                paralogs.sort()
+                paralogs.append(int(gene_id))
+                tmp_ids = paralogs
+                tmp_ids.sort()
+                # tmp_ids = sorted(tmp_ids, key=lambda p: genes.index(genes_by_id[str(p)]))
+
+                tsv = "\t".join([str(i) for i in paralogs])
+                tmp_tsv = "\t".join([str(i) for i in tmp_ids])
+
+                # Many genes share all their paralogs (minus themselves) with
+                # other genes.  This accounts for that, and compresses the
+                # combined paralog cache size by ~3x.
+                if "\t" in tsv:
+                    if tmp_tsv in genes_by_paralogs:
+                        pointer = genes_by_paralogs[tmp_tsv]
+                        pointer_id = ids_by_gene[pointer]
+                        tsv = '_' + pointer + "\t" + pointer_id
+                        num_redundant_paralogs += 1
+                    else:
+                        genes_by_paralogs[tmp_tsv] = original_gene
+
+                # Omit current gene from its own paralog list
+                split_tsv = tsv.split("\t")
+                if (gene_id in split_tsv):
+                    split_tsv.remove(gene_id)
+
+                tsv = "\t".join(split_tsv)
+                tsv = gene_id + "\t" + tsv
+
+                tsv = tsv.encode()
+                seen_genes[original_gene] = 1
             except Exception as e:
                 handled = "Encountered error converting TSV for gene"
                 handled2 = "not well-formed"
                 if handled in str(e) or handled2 in str(e):
                     # print('Handled an error')
                     print(e)
-                    optimize_errors.append(gene)
+                    optimize_errors.append(original_gene)
                     continue
                 else:
                     print('Encountered fatal error')
-                    print(e)
+                    print(traceback.format_exc())
                     # raise Exception(e)
+                    # print('json')
+                    # print(json)
+                    # exit()
                     continue
 
             with open(optimized_tsv_path, "wb") as f:
@@ -211,8 +279,10 @@ class EnsemblCache():
 
             tsv = tsv.decode('utf-8')
             if len(tsv) > 0:
-                rows.append(f"{gene}\t{tsv}")
+                rows.append(f"{original_gene}\t{tsv}")
 
+        print('num_redundant_paralogs')
+        print(num_redundant_paralogs)
         num_errors = len(optimize_errors)
         if num_errors > 0:
             print(f"{num_errors} pathways had optimization errors:")
@@ -235,11 +305,11 @@ class EnsemblCache():
         # if not os.path.exists(gpml_dir):
         #     os.makedirs(gpml_dir)
 
-        [genes, prefix] = fetch_genes(organism)
+        [genes, prefix, ids_by_gene, genes_by_id] = fetch_genes(organism)
         # self.fetch_paralogs(organism, genes, tmp_gene_dir)
         print('len(genes)')
         print(len(genes))
-        rows = self.optimize_paralogs(genes, tmp_gene_dir, gene_dir)
+        rows = self.optimize_paralogs(genes, ids_by_gene, genes_by_id, tmp_gene_dir, gene_dir)
 
         combined_dir = self.output_dir + "combined/"
         if not os.path.exists(combined_dir):
@@ -259,6 +329,7 @@ class EnsemblCache():
         """
         # organisms = ["Homo sapiens", "Mus musculus"] # Comment out to use all
         # organisms = ["Homo sapiens"] # Comment out to use all
+        # organisms = ["Mus musculus"] # Comment out to use all
         # organisms = ["Caenorhabditis elegans"] # Comment out to use all
         for organism in organisms:
             self.populate_by_org(organism)
